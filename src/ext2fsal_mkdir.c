@@ -146,31 +146,6 @@ uint32_t allocate_new_block_for_parent(uint32_t parent_inode_num) {
 
     return new_block;
 }
-
-int initialize_inode() {
-    // create a new dir with name = dir
-    uint32_t new_inode_num = find_free_inode();
-    if (new_inode_num == -1) {
-        return -1; // no space left
-    }
-    // update metadata
-    // update inode bitmap
-    inode_bitmap[(new_inode_num - 1) / 8] |= 1 << ((new_inode_num - 1) % 8);
-
-    // update group descriptor
-    gd->bg_free_inodes_count--;
-
-    // update superblock
-    sb->s_free_inodes_count--;
-    struct ext2_inode* inode = &inode_table[new_inode_num - 1];
-    inode->i_mode = EXT2_S_IFDIR | 0755; // owner can read write exec, non-owner can read and execute
-    inode->i_size = EXT2_BLOCK_SIZE;
-    inode->i_blocks = EXT2_BLOCK_SIZE / 512; // i_blocks reflect actual disk sectors
-    
-    // initalize all block pointers to 0
-    memset(inode->i_block, 0, 15 * sizeof(unsigned int));
-    return new_inode_num;
-}
      
 void add_dir_entry_to_new_block(uint32_t parent_inode_num, uint32_t new_inode_num, char* dir, uint32_t new_block) {
     struct ext2_dir_entry *new_entry = (struct ext2_dir_entry *) (disk + new_block * EXT2_BLOCK_SIZE);
@@ -235,10 +210,6 @@ int initialize_dir_entry(uint32_t new_inode_num, uint32_t parent_inode_num) {
     if (new_dir_block == -1) {
         return -1;
     }
-    // update bookkeeping structures to reserve this block
-    block_bitmap[new_dir_block / 8] |= 1 << (new_dir_block % 8);
-    gd->bg_free_blocks_count--;
-    sb->s_free_blocks_count--;
 
     struct ext2_inode* inode = &inode_table[new_inode_num - 1];
     inode->i_block[0] = new_dir_block;
@@ -262,6 +233,50 @@ int initialize_dir_entry(uint32_t new_inode_num, uint32_t parent_inode_num) {
     dot_dot_entry->rec_len = EXT2_BLOCK_SIZE - 12;
     return 0;
 }
+void restore_parent_inode(int parent_inode_num, int new_block) {
+    /*
+    This function is called when the parent inode uses a new allocated data block 
+    but either the inode or directory initialization failed so parent_inode must 
+    mark the allocated block as not in use
+    */
+    // since parent_inode is updated already, need to restore previous state
+    struct ext2_inode* parent_inode = &inode_table[parent_inode_num - 1];
+    bool found = false;
+    int i = 0;
+    while (!found) {
+        if (parent_inode->i_block[i] == new_block) {
+            parent_inode->i_block[i] = 0;
+            found = true;
+        }
+        i++;
+    }
+    parent_inode->i_size -= EXT2_BLOCK_SIZE;
+    parent_inode->i_blocks -= (EXT2_BLOCK_SIZE / 512);
+
+}
+
+void handle_failed_initialize_new_inode(char* normalized_path, int parent_inode_num, int new_block) {
+    // no free inode remaining
+    // free normalized path
+    free(normalized_path);
+    
+    restore_parent_inode(parent_inode_num, new_block);
+    
+    // release allocated block by updating bookkeeping structures
+    release_block(new_block);
+}
+
+void handle_failed_initalize_dir_entry(char* normalized_path, int parent_inode_num, int new_inode_num, int new_block) {
+    // no free block remaining
+    free(normalized_path);
+
+    restore_parent_inode(parent_inode_num, new_block);
+
+    // release allocated block and inode
+    release_block(new_block);
+    release_inode(new_inode_num);
+
+}
 
 int32_t ext2_fsal_mkdir(const char *path)
 {
@@ -278,129 +293,90 @@ int32_t ext2_fsal_mkdir(const char *path)
         return EEXIST;
     }
 
-    const char* delimiter = "/";
-    // tokenize to extract individual directory leading up to directory to be created
-    char* dir = strtok(normalized_path, delimiter);
-    char* next_dir;
-    int current_inode_num = EXT2_ROOT_INO;
-    int parent_inode_num;
-    while (dir != NULL) {
-        next_dir = strtok(NULL, delimiter);
-        int child_inode_num = get_child_dir_inode_num(current_inode_num, dir);
-
-        if (child_inode_num == -1) {
-            // dir is a regular file
-            free(normalized_path);
-            return ENOENT;
-        }
-        if (next_dir == NULL) {
-            // dir is directory user wants to create
-            // check if dir already exists first
-            if (child_inode_num != -2) {
-                // this means dir already exists
-                free(normalized_path);
-                return EEXIST;
-            } else {
-                // update parent_inode_num
-                parent_inode_num = current_inode_num;
-
-                if (!has_space_in_parent_last_used_block(parent_inode_num, dir)) {
-                    int new_block = allocate_new_block_for_parent(parent_inode_num);
-                    if (new_block == -1) {
-                        free(normalized_path);
-                        return ENOSPC; // no space left
-                    }
-                    int new_inode_num = initialize_inode();
-                    if (new_inode_num == -1) {
-                        // no free inode remaining
-                        // free normalized path
-                        free(normalized_path);
-
-                        // since parent_inode is updated already, need to restore previous state
-                        struct ext2_inode* parent_inode = &inode_table[parent_inode_num - 1];
-                        bool found = false;
-                        int i = 0;
-                        while (!found) {
-                            if (parent_inode->i_block[i] == new_block) {
-                                parent_inode->i_block[i] = 0;
-                                found = true;
-                            }
-                            i++;
-                        }
-                        parent_inode->i_size -= EXT2_BLOCK_SIZE;
-                        parent_inode->i_blocks -= (EXT2_BLOCK_SIZE / 512);
-
-                        // release allocated block by updating bookkeeping structures
-                        release_block(new_block);
-                        return ENOSPC; 
-                    }
-                    int res = initialize_dir_entry(new_inode_num, parent_inode_num);
-                    if (res == -1) {
-                        // no free block remaining
-                        free(normalized_path);
-
-                        // since parent_inode is updated already, need to restore previous state
-                        struct ext2_inode* parent_inode = &inode_table[parent_inode_num - 1];
-                        bool found = false;
-                        int i = 0;
-                        while (!found) {
-                            if (parent_inode->i_block[i] == new_block) {
-                                parent_inode->i_block[i] = 0;
-                                found = true;
-                            }
-                            i++;
-                        }
-                        parent_inode->i_size -= EXT2_BLOCK_SIZE;
-                        parent_inode->i_blocks -= (EXT2_BLOCK_SIZE / 512);
-
-                        // release allocated block and inode
-                        release_block(new_block);
-                        release_inode(new_inode_num);
-
-                        return ENOSPC; 
-                    }
-                    add_dir_entry_to_new_block(parent_inode_num, new_inode_num, dir, new_block);
-
-                } else {
-                    int new_inode_num = initialize_inode();
-                    if (new_inode_num == -1) {
-                        free(normalized_path);
-                        return ENOSPC; // no free inode remaining
-                    }
-                    int res = initialize_dir_entry(new_inode_num, parent_inode_num);
-                    if (res == -1) {
-                        // no free block remaining
-                        free(normalized_path);
-
-                        // release allocated inode
-                        release_inode(new_inode_num);
-
-                        return ENOSPC; 
-                    }
-                    // there is space in the last used block
-                    add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, dir);
-                }
-            }
-
-            
-        } else {
-            // dir is a directory along the path leading up to the directory to be created
-            // check if dir exists
-            if (child_inode_num == -2) {
-                // this meas a directory along the path does not exist
-                free(normalized_path);
-                return ENOENT;
-            }
-            else {
-                // save the parent node num before updating current_inode_num
-                parent_inode_num = current_inode_num;
-                // update current_inode to continue traversing the path
-                current_inode_num = child_inode_num;
-            }
-
-        }
-        dir = next_dir;
+    int path_validation_res = validate_path_exists(normalized_path);
+    if (path_validation_res == -2) {
+        // an intermediate folder does not exist or exists as a file
+        free(normalized_path);
+        return ENOENT;
     }
+    if (path_validation_res == 0) {
+        // a directory or file with the same name already exists
+        free(normalized_path);
+        return EEXIST;
+    }
+    
+    // traverse the path to get to the parent dir
+    const char* delimiter = "/";
+    size_t path_len = strlen(normalized_path);
+    char path_copy[path_len + 1];
+    strncpy(path_copy, normalized_path, path_len);
+    path_copy[path_len] = '\0';
+    char* saveptr;
+    char* token = strtok_r(path_copy, delimiter, &saveptr);
+    int current_inode_num = EXT2_ROOT_INO;
+    int parent_inode_num = current_inode_num;
+    char dir_name[EXT2_NAME_LEN + 1];
+    while (token != NULL) {
+        int child_inode_num = get_child_inode_num(current_inode_num, token);
+        if (child_inode_num == -1) {
+            // save name of directory to be created then break
+            // verify valid name length first
+            if (strlen(token) > EXT2_NAME_LEN) {
+                free(normalized_path);
+                return ENAMETOOLONG;
+            }
+
+            strncpy(dir_name, token, strlen(token));
+            dir_name[strlen(token)] = '\0';
+            break;
+        }
+        parent_inode_num = current_inode_num;
+        current_inode_num = child_inode_num;
+        token = strtok_r(NULL, delimiter, &saveptr);
+    }
+
+    // parent_inode_num now holds the inode number of immediate parent directory
+    if (!has_space_in_parent_last_used_block(parent_inode_num, dir_name)) {
+        int new_block = allocate_new_block_for_parent(parent_inode_num);
+        if (new_block == -1) {
+            free(normalized_path);
+            return ENOSPC; // no space left
+        }
+
+        int new_inode_num = initialize_new_inode(INODE_MODE_DIR);
+        if (new_inode_num == -1) {
+            handle_failed_initialize_new_inode(normalized_path, parent_inode_num, new_block);
+            return ENOSPC; 
+        }
+
+        int res = initialize_dir_entry(new_inode_num, parent_inode_num);
+        if (res == -1) {
+            handle_failed_initalize_dir_entry(normalized_path, parent_inode_num, new_inode_num, new_block);
+            return ENOSPC; 
+        }
+        add_dir_entry_to_new_block(parent_inode_num, new_inode_num, dir_name, new_block);
+    }
+    else {
+        // there is enough space in parent's last used block
+        int new_inode_num = initialize_inode();
+        if (new_inode_num == -1) {
+            free(normalized_path);
+            return ENOSPC; // no free inode remaining
+        }
+        int res = initialize_dir_entry(new_inode_num, parent_inode_num);
+        if (res == -1) {
+            // no free block remaining
+            free(normalized_path);
+
+            // release allocated inode
+            release_inode(new_inode_num);
+
+            return ENOSPC; 
+        }
+        // there is space in the last used block
+        add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, dir_name);
+    }
+
     free(normalized_path);
     
     return 0;

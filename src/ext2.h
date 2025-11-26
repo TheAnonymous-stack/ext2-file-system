@@ -168,6 +168,9 @@ struct ext2_inode {
 /* #define EXT2_S_IFCHR  0x2000 */ /* character device */
 /* #define EXT2_S_IFIFO  0x1000 */ /* fifo */
 
+#define INODE_MODE_FILE 0
+#define INODE_MODE_DIR  1
+#define INODE_MODE_LINK 2
 
 /*
  * Special inode numbers

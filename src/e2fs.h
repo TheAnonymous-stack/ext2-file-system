@@ -24,9 +24,19 @@
 char* get_normalized_path(const char* path);
 bool is_inode_in_use(int inode_num);
 int find_free_inode();
+int initialize_new_inode(int mode);
 int find_free_block();
 void release_block(int block_num); 
 void release_inode(int inode_num);
+void clear_inode_data_blocks(int inode_num);
+int validate_path_exists(const char* path);
+void traverse_path(const char* path, int* parent_inode, int* child_inode);
+char* get_path_to_parent(const char* path);
 
-int get_child_dir_inode_num(int parent_inode_num, const char* child_name);
+int get_child_inode_num(int parent_inode_num, const char* child_name);
+bool is_inode_to_dir(int inode_num);
+bool is_inode_to_file(int inode_num);
+
+
+
 #endif
