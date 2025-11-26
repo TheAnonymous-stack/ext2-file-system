@@ -31,180 +31,6 @@ extern pthread_mutex_t datablock_bitmap_lock;
 extern pthread_mutex_t superblock_lock;
 extern pthread_mutex_t group_desc_lock;
 
-
-bool has_space_in_parent_last_used_block(uint32_t parent_inode_num, const char* new_dir_name) {
-
-    
-    // calculate amount of space needed for a new dir entry with name = new_dir_name
-    int metadata_bytes = 8; // 4 bytes for inode, 2 bytes for rec_len, 1 byte for name_len, 1 byte for file_type
-    int name_len = (int) strlen(new_dir_name);
-    int new_padding = ((name_len + metadata_bytes) % 4 == 0) ? 0 : (4 - ((name_len + metadata_bytes) % 4));
-    int new_entry_size = name_len + metadata_bytes + new_padding;
-
-    struct ext2_inode *parent_inode = &inode_table[parent_inode_num - 1];
-
-    // find the last used block
-    int last_block_idx = -1;
-    for (int i = 0; i < 15; i++) {
-        if (parent_inode->i_block[i] != 0) {
-            last_block_idx = i;
-        }
-    }
-
-    if (last_block_idx == -1) {
-        // sanity check since a valid directory must have at least 1 block with . and .. entries
-        return false;
-    }
-
-    uint32_t last_block_num = parent_inode->i_block[last_block_idx];
-    char* block_data = (char*)(disk + last_block_num * EXT2_BLOCK_SIZE);
-
-    // find amount of space used in last block
-    int used_space = 0;
-    struct ext2_dir_entry* entry = (struct ext2_dir_entry*) (block_data + used_space);
-    while (used_space < EXT2_BLOCK_SIZE && entry->rec_len > 0) {
-        
-        if (is_inode_in_use(entry->inode)) {
-            // valid entry
-            // note that rec_len = actual entry size of a dir entry except the last dir entry
-            // rec_len of the last dir entry is the amount of remaining space until end of block
-            int padding = ((entry->name_len + metadata_bytes) % 4 == 0) ? 0 : 4 - ((entry->name_len + metadata_bytes) % 4);
-            int actual_entry_size = entry->name_len + metadata_bytes + padding;
-            if (used_space + entry->rec_len == EXT2_BLOCK_SIZE) {
-                // entry is the last dir_entry
-                used_space += actual_entry_size;
-                break;
-            } else {
-                // entry is not the last dir so rec_len = actual_entry_size
-                used_space += entry->rec_len;
-            }
-        } else {
-            // invalid entry at this point
-            break;
-        }
-        entry = (struct ext2_dir_entry*) (block_data + used_space);
-    }
-
-    return EXT2_BLOCK_SIZE - used_space >= new_entry_size;
-}
-
-uint32_t allocate_new_block_for_parent(uint32_t parent_inode_num) {
-    struct ext2_inode *parent_inode = &inode_table[parent_inode_num - 1];
-    int next_block_idx = -1;
-    for (int i = 0; i < 15; i++) {
-        if (parent_inode->i_block[i] == 0) {
-            next_block_idx = i; // found an available direct block
-            break;
-        }
-    }
-
-    if (next_block_idx == -1) {
-        // shouldn't happen because one of the simplifying assumptions states that directories only need direct pointers, not indirect
-        return -1;
-    }
-
-    // allocate new available block
-    int new_block = -1;
-    for (uint32_t i = 0; i < sb->s_blocks_count; i++) {
-        int byte_idx = i / 8;
-        int bit_idx = i % 8;
-        if (!((block_bitmap[byte_idx] >> bit_idx) & 1)) {
-            // block is available
-            new_block = i;
-        }
-    }
-
-    if (new_block == -1) {
-        // no space left
-        return -1;
-    }
-  
-    // save block number to i_block[next_block_idx]
-    parent_inode->i_block[next_block_idx] = new_block;
-
-    // allocate a new block to the directory so the size of the directory is increased by EXT2_BLOCK_SIZE
-    parent_inode->i_size += EXT2_BLOCK_SIZE;
-
-    // logical block can be of different size compared to physical disk sector
-    // the i_blocks attribute reflect the number physical disk sector required
-    parent_inode->i_blocks += (EXT2_BLOCK_SIZE / 512);
-
-    // zero out new block
-    char* new_block_data = (char*) (disk + new_block * EXT2_BLOCK_SIZE);
-    memset(new_block_data, 0, EXT2_BLOCK_SIZE);
-
-    // update metadata
-    // update block bitmap
-    block_bitmap[new_block / 8] |=  1 << (new_block % 8);
-
-    // update group descriptor
-    gd->bg_free_blocks_count--;
-
-    // update super block
-    sb->s_free_blocks_count--;
-
-
-    return new_block;
-}
-     
-void add_dir_entry_to_new_block(uint32_t parent_inode_num, uint32_t new_inode_num, char* dir, uint32_t new_block) {
-    struct ext2_dir_entry *new_entry = (struct ext2_dir_entry *) (disk + new_block * EXT2_BLOCK_SIZE);
-    new_entry->inode = new_inode_num;
-    new_entry->name_len = strlen(dir);
-    strncpy(new_entry->name, dir, strlen(dir));
-    new_entry->file_type = EXT2_FT_DIR;
-    // since this is the first entry to a new block
-    new_entry->rec_len = EXT2_BLOCK_SIZE;
-
-}
-
-void add_dir_entry_to_last_used_block(uint32_t parent_inode_num, uint32_t new_inode_num, char* dir) {
-    // find last used block first
-    struct ext2_inode *parent_inode = &inode_table[parent_inode_num - 1];
-
-    // find the next available block
-    int last_block_idx = -1;
-    for (int i = 0; i < 15; i++) {
-        if (parent_inode->i_block[i] != 0) {
-            last_block_idx = i;
-            
-        }
-    }
-
-    int block_num = parent_inode->i_block[last_block_idx];
-
-    char* block_data = (struct ext2_dir_entry *) (disk + block_num * EXT2_BLOCK_SIZE);
-    int used_space = 0;
-    int metadata_bytes = 8; // 4 bytes for inode, 2 bytes for rec_len, 1 byte for name_len, 1 byte for file_type
-    struct ext2_dir_entry* entry = (struct ext2_dir_entry*) (block_data + used_space);
-    while (used_space < EXT2_BLOCK_SIZE && entry->rec_len > 0) {
-        if (is_inode_in_use(entry->inode)) {
-            // valid entry
-            int padding = ((entry->name_len + metadata_bytes) % 4 == 0) ? 0 : 4 - ((entry->name_len + metadata_bytes) % 4);
-            int actual_entry_size = entry->name_len + metadata_bytes + padding;
-            if (used_space + entry->rec_len == EXT2_BLOCK_SIZE) {
-                // entry is the last dir_entry
-                entry->rec_len = actual_entry_size;
-                used_space += actual_entry_size;
-                entry = (struct ext2_dir_entry*) (block_data + used_space); 
-                break;
-            } else {
-                // entry is not the last dir so rec_len = actual_entry_size
-                used_space += entry->rec_len;
-            }
-        }
-        entry = (struct ext2_dir_entry*) (block_data + used_space); 
-    }
-
-    // entry is the next available entry in the last used block at this point
-    // used space is also the cumulative space used for all previous dir entries in the same block
-    entry->inode = new_inode_num;
-    entry->name_len = strlen(dir);
-    strncpy(entry->name, dir, strlen(dir));
-    entry->file_type = EXT2_FT_DIR;
-    entry->rec_len = EXT2_BLOCK_SIZE - used_space;
-}
-
 int initialize_dir_entry(uint32_t new_inode_num, uint32_t parent_inode_num) {
     int new_dir_block = find_free_block();
     if (new_dir_block == -1) {
@@ -354,7 +180,7 @@ int32_t ext2_fsal_mkdir(const char *path)
             handle_failed_initalize_dir_entry(normalized_path, parent_inode_num, new_inode_num, new_block);
             return ENOSPC; 
         }
-        add_dir_entry_to_new_block(parent_inode_num, new_inode_num, dir_name, new_block);
+        add_dir_entry_to_new_block(parent_inode_num, new_inode_num, dir_name, new_block, EXT2_FT_DIR);
     }
     else {
         // there is enough space in parent's last used block
@@ -374,7 +200,7 @@ int32_t ext2_fsal_mkdir(const char *path)
             return ENOSPC; 
         }
         // there is space in the last used block
-        add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, dir_name);
+        add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, dir_name, EXT2_FT_DIR);
     }
 
     free(normalized_path);

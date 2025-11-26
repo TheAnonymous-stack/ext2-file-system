@@ -31,7 +31,7 @@ extern pthread_mutex_t datablock_bitmap_lock;
 extern pthread_mutex_t superblock_lock;
 extern pthread_mutex_t group_desc_lock;
 
-int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_file, char* normalized_dst_path) {
+int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_file) {
     // copy data from src file to data blocks
 
     // get size of src file first
@@ -53,7 +53,6 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
             clear_inode_data_blocks(new_inode_num);
             release_inode(new_inode_num);
             fclose(src_file);
-            free(normalized_dst_path);
             return ENOSPC;
         }
 
@@ -73,7 +72,6 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
         if (bytes_read != bytes_to_copy) {
             // error reading from src file
             fclose(src_file);
-            free(normalized_dst_path);
             clear_inode_data_blocks(new_inode_num);
             release_inode(new_inode_num);
             
@@ -92,7 +90,6 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
             fclose(src_file);
             clear_inode_data_blocks(new_inode_num);
             release_inode(new_inode_num);
-            free(normalized_dst_path);
             return ENOSPC;
         }
 
@@ -110,7 +107,6 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
                 clear_inode_data_blocks(new_inode_num);
                 release_inode(new_inode_num);
                 fclose(src_file);
-                free(normalized_dst_path);
                 return ENOSPC;
             }
 
@@ -125,7 +121,6 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
                 clear_inode_data_blocks(new_inode_num);
                 release_inode(new_inode_num);
                 fclose(src_file);
-                free(normalized_dst_path);
                 return EIO;
             }
 
@@ -137,24 +132,23 @@ int copy_file_to_parent_dir(int parent_inode_num, int new_inode_num, FILE* src_f
     return 0;
 }
 
-int add_file_as_parent_dir_entry(int parent_inode_num, int new_inode_num, FILE* src_file, char* normalized_dst_path, char* filename){
+int add_file_as_parent_dir_entry(int parent_inode_num, int new_inode_num, FILE* src_file, char* filename){
     // add directory entry to parent directory
     if (!has_space_in_parent_last_used_block(parent_inode_num, filename)) {
         // allocate new block for parent directory
-        int new_parent_block = find_free_block();
+        int new_parent_block = allocate_new_block_for_parent(parent_inode_num);
         if (new_parent_block == -1) {
             // no space left
             clear_inode_data_blocks(new_inode_num);
             release_inode(new_inode_num);
             fclose(src_file);
-            free(normalized_dst_path);
             return ENOSPC;
         }
-        add_dir_entry_to_new_block(parent_inode_num, new_inode_num, filename, new_parent_block);
+        add_dir_entry_to_new_block(parent_inode_num, new_inode_num, filename, new_parent_block, EXT2_FT_REG_FILE);
     } 
     else {
         // last used block of parent dir has enough space
-        add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, filename);
+        add_dir_entry_to_last_used_block(parent_inode_num, new_inode_num, filename, EXT2_FT_REG_FILE);
     }
     return 0;
 }
@@ -193,6 +187,7 @@ int32_t ext2_fsal_cp(const char *src,
     if (path_validation_res == -2) {
         // an intermediate folder does not exist or exists as a file
         free(normalized_dst_path);
+        fclose(src_file);
         return ENOENT;
     }
 
@@ -212,9 +207,10 @@ int32_t ext2_fsal_cp(const char *src,
         char* last_slash = strrchr(normalized_dst_path, '/');
         char* filename = (last_slash != NULL) ? (last_slash + 1) : normalized_dst_path;
 
+        free(normalized_dst_path);
+
         if (strlen(filename) > EXT2_NAME_LEN) {
             fclose(src_file);
-            free(normalized_dst_path);
             return ENAMETOOLONG;
         }
         // need to allocate inode for the new file
@@ -222,16 +218,15 @@ int32_t ext2_fsal_cp(const char *src,
         int new_inode_num = initialize_new_inode(INODE_MODE_FILE);
         if (new_inode_num == -1) {
             fclose(src_file);
-            free(normalized_dst_path);
             return ENOSPC;
         }
 
-        int res = copy_file_to_parent_dir(parent_inode_num, new_inode_num, src_file, normalized_dst_path);
+        int res = copy_file_to_parent_dir(parent_inode_num, new_inode_num, src_file);
         if (res != 0) {
             return res;
         }
 
-        res = add_file_as_parent_dir_entry(parent_inode_num, new_inode_num, src_file, normalized_dst_path, filename);
+        res = add_file_as_parent_dir_entry(parent_inode_num, new_inode_num, src_file, filename);
         if (res != 0) {
             return res;
         }
@@ -239,7 +234,7 @@ int32_t ext2_fsal_cp(const char *src,
     }
     else {
         // path_validation_res = 0 at this point
-        // this means there exists a file/folder with same name
+        // this means there exists a file/folder/symlink with same name
 
         // traverse the path first
         int parent_inode_num;
@@ -250,19 +245,19 @@ int32_t ext2_fsal_cp(const char *src,
         if (is_inode_to_dir(child_inode_num)) {
             // need to allocate inode for the new file
 
+            free(normalized_dst_path);
             int new_inode_num = initialize_new_inode(INODE_MODE_FILE);
             if (new_inode_num == -1) {
                 fclose(src_file);
-                free(normalized_dst_path);
                 return ENOSPC;
             }
 
-            int res = copy_file_to_parent_dir(child_inode_num, new_inode_num, src_file, normalized_dst_path);
+            int res = copy_file_to_parent_dir(child_inode_num, new_inode_num, src_file);
             if (res != 0) {
                 return res;
             }
 
-            res = add_file_as_parent_dir_entry(child_inode_num, new_inode_num, src_file, normalized_dst_path, src_file_name);
+            res = add_file_as_parent_dir_entry(child_inode_num, new_inode_num, src_file, src_file_name);
             if (res != 0) {
                 return res;
             }
@@ -274,19 +269,42 @@ int32_t ext2_fsal_cp(const char *src,
             char* last_slash = strrchr(normalized_dst_path, '/');
             char* filename = (last_slash != NULL) ? (last_slash + 1) : normalized_dst_path;
 
+            free(normalized_dst_path);
+
             if (strlen(filename) > EXT2_NAME_LEN) {
                 fclose(src_file);
-                free(normalized_dst_path);
                 return ENAMETOOLONG;
             }
-            int res = copy_file_to_parent_dir(parent_inode_num, child_inode_num, src_file, normalized_dst_path);
+            int res = copy_file_to_parent_dir(parent_inode_num, child_inode_num, src_file);
             if (res != 0) {
                 return res;
             }
 
+        } 
+        else if (is_inode_to_symlink(child_inode_num)) {
+            // overwrite existing symlink
+            clear_inode_data_blocks(child_inode_num);
+
+            struct ext2_inode* symlink_inode = &inode_table[child_inode_num - 1];
+            symlink_inode->i_mode = EXT2_S_IFREG | 0644;
+
+            char* last_slash = strrch(normalized_dst_path, '/');
+            char* filename = (last_slash != NULL) ? (last_slash + 1) : normalized_dst_path;
+
+            free(normalized_dst_path);
+
+            if (strlen(filename) > EXT2_NAME_LEN) {
+                fclose(src_file);
+                return ENAMETOOLONG;
+            }
+
+            int res = copy_file_to_parent_dir(parent_inode_num, child_inode_num, src_file);
+            if (res != 0) {
+                return res;
+            }
         }
     }
-    free(normalized_dst_path);  
+      
     fclose(src_file);
 
     return 0;

@@ -36,7 +36,12 @@ char* get_path_to_parent(const char* path);
 int get_child_inode_num(int parent_inode_num, const char* child_name);
 bool is_inode_to_dir(int inode_num);
 bool is_inode_to_file(int inode_num);
+bool is_inode_to_symlink(int inode_num);
 
+bool has_space_in_parent_last_used_block(int parent_inode_num, const char* new_dir_name);
+int allocate_new_block_for_parent(int parent_inode_num);
+void add_dir_entry_to_new_block(int parent_inode_num, int new_inode_num, char* dir, int new_block, int file_type);
+void add_dir_entry_to_last_used_block(int parent_inode_num, int new_inode_num, char* dir, int file_type);
 
 
 #endif
